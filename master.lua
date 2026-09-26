@@ -16,6 +16,11 @@
         Deploy right here: the area starts in the block in front of the
         master and extends <length> blocks forward and <width> blocks to its
         right, from the layer below the master down <depth> layers.
+    master gps <x> <y> <z> <north|south|east|west> [height]
+        Build a GPS constellation above the master. Give the master's own
+        coordinates and facing (from the F3 screen). It needs 4 computers
+        with gpshost.lua installed and 4 wireless or ender modems. The hosts
+        are built around y=<height> (default 240).
     master monitor      reattach to a running job
     master recall       call every worker back
 
@@ -44,6 +49,7 @@ local workers = {} -- { id, x0, x1, phase, msg, fuel, progress, y }
 
 local function usage()
   print("Usage:")
+  print("  master gps <x> <y> <z> <facing> [height]")
   print("  master dig <x> <y> <z> <sizeX> <sizeZ> <depth> [workers]")
   print("  master <width> <length> <depth> [workers]")
   print("  master monitor")
@@ -138,15 +144,46 @@ local STEP = {
 local function locate()
   local x, y, z = gps.locate(5)
   if not x then
-    error("No GPS signal. GPS hosts must be in range (ender modems recommended).", 0)
+    error("No GPS signal. Build GPS hosts with 'master gps' or move into range.", 0)
   end
   return math.floor(x + 0.5), math.floor(y + 0.5), math.floor(z + 0.5)
+end
+
+-- Tops up the master's fuel from one of its fuel ender chests. Needs one
+-- empty slot among 1-14 to pull fuel into.
+local function refuelMaster(need)
+  local level = turtle.getFuelLevel()
+  if level == "unlimited" or level >= need then return true end
+  if need > turtle.getFuelLimit() then return false end
+  local slot
+  for s = 1, 14 do
+    if turtle.getItemCount(s) == 0 then slot = s break end
+  end
+  if not slot or turtle.getItemCount(FUEL_CHEST_SLOT) == 0 then return false end
+  turtle.select(FUEL_CHEST_SLOT)
+  if turtle.detectUp() then turtle.digUp() end
+  if not turtle.placeUp() then return false end
+  turtle.select(slot)
+  while turtle.getFuelLevel() < need do
+    if turtle.getItemCount(slot) == 0 and not turtle.suckUp() then break end
+    if not turtle.refuel(1) then break end
+  end
+  if turtle.getItemCount(slot) > 0 then turtle.dropUp() end
+  turtle.select(FUEL_CHEST_SLOT)
+  turtle.digUp()
+  turtle.select(1)
+  return turtle.getFuelLevel() >= need
 end
 
 -- Moves one block, digging through anything breakable. Returns false if the
 -- way is blocked by an unbreakable block or the world's height limits.
 local function step(dir)
   local a = STEP[dir]
+  local level = turtle.getFuelLevel()
+  if level ~= "unlimited" and level < FUEL_MARGIN then
+    -- Detours used more than estimated: top up in mid-journey if possible.
+    refuelMaster(FUEL_MARGIN * 5)
+  end
   while true do
     local ok, err = a.move()
     if ok then
@@ -205,34 +242,9 @@ local function findHeading()
   error("Cannot work out which way the master is facing: it cannot move.", 0)
 end
 
--- Tops up the master's fuel from one of its fuel ender chests. Needs one
--- empty slot among 1-14 to pull fuel into.
-local function refuelMaster(need)
-  local level = turtle.getFuelLevel()
-  if level == "unlimited" or level >= need then return true end
-  if need > turtle.getFuelLimit() then return false end
-  local slot
-  for s = 1, 14 do
-    if turtle.getItemCount(s) == 0 then slot = s break end
-  end
-  if not slot or turtle.getItemCount(FUEL_CHEST_SLOT) == 0 then return false end
-  turtle.select(FUEL_CHEST_SLOT)
-  if turtle.detectUp() then turtle.digUp() end
-  if not turtle.placeUp() then return false end
-  turtle.select(slot)
-  while turtle.getFuelLevel() < need do
-    if turtle.getItemCount(slot) == 0 and not turtle.suckUp() then break end
-    if not turtle.refuel(1) then break end
-  end
-  if turtle.getItemCount(slot) > 0 then turtle.dropUp() end
-  turtle.select(FUEL_CHEST_SLOT)
-  turtle.digUp()
-  turtle.select(1)
-  return turtle.getFuelLevel() >= need
-end
-
 -- Climbs to a cruising height, flies across, then digs down to the target.
-local function travelTo(tx, ty, tz)
+-- Unless `noGps` is set, the arrival point is checked against GPS.
+local function travelTo(tx, ty, tz, noGps)
   local cruise = math.min(MAX_Y, math.max(nav.y, ty) + CRUISE_ABOVE)
   local need = math.abs(tx - nav.x) + math.abs(tz - nav.z)
     + math.abs(cruise - nav.y) + math.abs(cruise - ty) + FUEL_MARGIN
@@ -247,21 +259,143 @@ local function travelTo(tx, ty, tz)
   local function blocked()
     error(("Path blocked at %d %d %d"):format(nav.x, nav.y, nav.z), 0)
   end
+  -- Steps sideways (or back) when both ahead and above are unbreakable.
+  local function sidestep()
+    local h = nav.h
+    for _, turn in ipairs({ 1, 3, 2 }) do
+      turnTo((h + turn) % 4)
+      if step("fwd") then return true end
+    end
+    return false
+  end
+  local function distance() return math.abs(tx - nav.x) + math.abs(tz - nav.z) end
+  local best, detours, prefer = distance(), 0, nil
   while nav.x ~= tx or nav.z ~= tz do
-    if nav.x ~= tx then
+    -- After a sidestep, keep trying the blocked axis so we go around the
+    -- obstacle instead of stepping straight back.
+    local axis
+    if prefer == "z" and nav.z ~= tz then axis = "z"
+    elseif nav.x ~= tx then axis = "x"
+    else axis = "z" end
+    if axis == "x" then
       turnTo(nav.x < tx and 0 or 2)
     else
       turnTo(nav.z < tz and 1 or 3)
     end
     -- Dig through obstacles; climb over anything unbreakable.
-    if not step("fwd") and not step("up") then blocked() end
+    if step("fwd") then
+      prefer = nil
+    elseif not step("up") then
+      if not sidestep() then blocked() end
+      prefer = axis
+      detours = detours + 1
+    end
+    if distance() < best then
+      best, detours = distance(), 0
+    elseif detours > 64 then
+      blocked()
+    end
   end
+  -- Something unbreakable directly above the destination cannot be worked around.
   while nav.y > ty do if not step("down") then blocked() end end
   while nav.y < ty do if not step("up") then blocked() end end
+  if noGps then return end
 
   local x, y, z = locate()
   if x ~= tx or y ~= ty or z ~= tz then
     error(("Arrived at %d %d %d instead of %d %d %d."):format(x, y, z, tx, ty, tz), 0)
+  end
+end
+
+---------------------------------------------------------------------------
+-- Building a GPS constellation
+---------------------------------------------------------------------------
+
+-- Four hosts: three level with the centre and one raised, so they are not
+-- all in one plane (GPS needs that to give a single answer). The column
+-- above the master's start is left clear so it can fly straight back down.
+local GPS_SPACING = 6
+local GPS_OFFSETS = {
+  { GPS_SPACING, 0, 0 }, { -GPS_SPACING, 0, 0 }, { 0, 0, GPS_SPACING },
+  { 0, GPS_SPACING, -GPS_SPACING },
+}
+local FACINGS = { east = 0, south = 1, west = 2, north = 3 }
+
+local function findSlot(pattern, exclude)
+  for s = 1, 16 do
+    local d = turtle.getItemDetail(s)
+    if d and d.name:find(pattern) and not (exclude and exclude[s]) then return s end
+  end
+end
+
+-- Places one host computer at (x, y, z) with a modem on top of it and radios
+-- it its coordinates. The computer must already have gpshost.lua installed.
+local function buildHost(x, y, z, computerSlot, modemSlot)
+  travelTo(x, y + 1, z, true)
+  if turtle.detectDown() and not turtle.digDown() then
+    error(("Cannot clear the block at %d %d %d"):format(x, y, z), 0)
+  end
+  turtle.select(computerSlot)
+  if not turtle.placeDown() then error("Could not place a GPS computer.", 0) end
+  local id = peripheral.call("bottom", "getID")
+  peripheral.call("bottom", "turnOn")
+
+  -- A modem placed into the gap above the computer attaches to its top.
+  if not step("up") then error("Cannot move above the GPS computer.", 0) end
+  turtle.select(modemSlot)
+  if not turtle.placeDown() then error("Could not place a modem on the GPS computer.", 0) end
+  turtle.select(1)
+
+  for _ = 1, 30 do
+    rednet.send(id, { type = "gps_setup", x = x, y = y, z = z }, PROTOCOL)
+    local sid, msg = rednet.receive(PROTOCOL, 1)
+    if sid == id and type(msg) == "table" and msg.type == "gps_ack" then
+      print(("GPS host #%d running at %d %d %d"):format(id, x, y, z))
+      return
+    end
+  end
+  error(("GPS computer #%d did not answer. Run 'gpshost install' on it first."):format(id), 0)
+end
+
+local function buildGps(sx, sy, sz, facing, cy)
+  local computers, modems = {}, 0
+  for s = 1, 16 do
+    local d = turtle.getItemDetail(s)
+    if d and d.name:find("^computercraft:computer") then computers[#computers + 1] = s end
+    if d and d.name:find("^computercraft:wireless_modem") then modems = modems + d.count end
+  end
+  if #computers < #GPS_OFFSETS or modems < #GPS_OFFSETS then
+    printError(("Need %d computers (with gpshost installed) and %d wireless or ender modems."):format(
+      #GPS_OFFSETS, #GPS_OFFSETS))
+    return
+  end
+
+  nav = { x = sx, y = sy, z = sz, h = facing }
+  local need = 2 * math.abs(cy - sy) + 12 * GPS_SPACING + 8 * CRUISE_ABOVE + FUEL_MARGIN
+  if not refuelMaster(need) then
+    printError(("The master needs %d fuel and has %s. Refuel it, or give it a fuel ender "
+      .. "chest in slot %d and an empty slot."):format(need, tostring(turtle.getFuelLevel()), FUEL_CHEST_SLOT))
+    return
+  end
+
+  print(("Building GPS hosts around %d %d %d"):format(sx, cy, sz))
+  for i, o in ipairs(GPS_OFFSETS) do
+    local modemSlot = findSlot("^computercraft:wireless_modem")
+    buildHost(sx + o[1], cy + o[2], sz + o[3], computers[i], modemSlot)
+  end
+
+  print("Returning to the starting point")
+  travelTo(sx, sy, sz, true)
+  turnTo(facing)
+  sleep(1)
+  local x, y, z = gps.locate(5)
+  if x and math.floor(x + 0.5) == sx and math.floor(y + 0.5) == sy and math.floor(z + 0.5) == sz then
+    print("GPS works: the master is at " .. sx .. " " .. sy .. " " .. sz)
+  elseif x then
+    printError(("GPS answers %d %d %d, but the master should be at %d %d %d. Check the coordinates "
+      .. "you entered."):format(x, y, z, sx, sy, sz))
+  else
+    printError("The GPS hosts are built, but GPS does not answer yet.")
   end
 end
 
@@ -474,6 +608,20 @@ local function finish(ok)
     print("Deployment stopped; " .. #workers .. " worker(s) are already running.")
     print("Use 'master monitor' or 'master recall'.")
   end
+end
+
+if args[1] == "gps" then
+  local x, y, z = tonumber(args[2]), tonumber(args[3]), tonumber(args[4])
+  local facing = args[5] and FACINGS[args[5]:lower()]
+  local height = tonumber(args[6]) or 240
+  if not (x and y and z and facing) then
+    usage()
+    return
+  end
+  print(("Master at %d %d %d facing %s; GPS hosts will be built around y=%d."):format(
+    x, y, z, args[5]:lower(), height))
+  if confirm() then buildGps(math.floor(x), math.floor(y), math.floor(z), facing, math.floor(height)) end
+  return
 end
 
 if args[1] == "dig" then

@@ -11,6 +11,7 @@ wherever it is.
 |--------------|----------------|----------------------------------------------------|
 | `master.lua` | master turtle  | Places the workers, hands out jobs, shows a status screen |
 | `worker.lua` | worker turtles | Mines one strip, dumps items and refuels through ender chests |
+| `gpshost.lua` | GPS computers | Receives its coordinates from the master, then runs `gps host` |
 
 ## Requirements
 
@@ -20,8 +21,9 @@ wherever it is.
 - **Master:** a mining turtle (pickaxe) with a wireless modem. With
   `master dig`, the pickaxe lets it dig through terrain on the way.
 - **Workers:** mining turtles (pickaxe) with a wireless modem.
-- **For `master dig` only:** a working GPS constellation. GPS is not needed
-  when you place the master by hand; the workers never need it.
+- **For `master dig` only:** a working GPS constellation. The master can
+  build one for you (see below). GPS is not needed when you place the
+  master by hand, and the workers never need it.
 - **For large areas:** use **ender modems** on the master, on the workers and
   on the GPS hosts. An ordinary wireless modem reaches only 64 blocks (more at
   high altitude), so workers far along a 512-block area would drop out of
@@ -54,6 +56,47 @@ Put `master.lua` on the master turtle in the same way.
 Connect the item frequency to your storage system, and keep the fuel
 frequency supplied with coal, charcoal, coal blocks, or another fuel.
 
+## Building GPS with the master
+
+If you have no GPS yet, the master can build a constellation of four GPS
+hosts above itself. You need four computers (advanced or normal) and four
+modems (ender modems are strongly recommended).
+
+1. On each computer, install the host program once:
+
+   ```
+   wget https://raw.githubusercontent.com/naverene/swarminer/master/gpshost.lua gpshost.lua
+   gpshost install
+   ```
+
+   Then break the computer. Being labelled, it keeps the program.
+2. Load the master with the four computers and the modems, in any slots.
+   It needs roughly 600 fuel. Alternatively, give it a fuel ender chest in
+   slot 16 and leave a slot empty, and it will refuel itself.
+3. Place the master **under open sky**, because it digs through anything
+   above it. Read its coordinates and the direction it faces from the F3
+   screen. The master's coordinates are the block it occupies. Then run:
+
+   ```
+   master gps <x> <y> <z> <north|south|east|west> [height]
+   ```
+
+The master tracks its own position from the coordinates you give it. It
+flies up to `height` (default 240) and builds the four hosts about 6 blocks
+around the column above its starting point: three level with each other and
+one 6 blocks higher. For each host, it places the computer, switches it on,
+places a modem on top of it, and radios the computer its exact coordinates.
+The computer saves them and runs `gps host` from then on, even after a
+restart.
+
+The master then flies back down to where it started. It checks that GPS
+reports the same coordinates you entered. If they differ, the coordinates or
+facing you entered were wrong. In that case, break the hosts, run
+`gpshost install` on them again, and repeat with the correct values.
+
+With ender modems the hosts cover the whole dimension. With ordinary
+wireless modems they cover a few hundred blocks at that height.
+
 ## Mining an area at given coordinates
 
 ```
@@ -70,8 +113,8 @@ z −2000 to −1489, from layer 64 down to bedrock.
 
 After you confirm, the master works out its position and facing by GPS,
 climbs a few blocks above the higher of its start and destination, and
-flies there. It digs through any obstacle it can, and climbs over any it
-cannot. It then parks at `x-1, y+1, z` facing east and deploys the
+flies there. It digs through any obstacle it can. It climbs over, or steps
+around, any obstacle it cannot dig. It then parks at `x-1, y+1, z` facing east and deploys the
 workers. The workers' strips run north–south across the Z axis, and each
 strip is `sizeX` blocks long.
 
