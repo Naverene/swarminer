@@ -8,10 +8,11 @@
     slot  16    fuel ender chests  (one per worker, all the same colours)
 
   Usage:
-    master dig <x> <y> <z> <sizeX> <sizeZ> <depth> [workers]
-        Travel (by GPS) to the area whose top north-west corner block is
-        x y z, then deploy. The area covers x..x+sizeX-1, z..z+sizeZ-1 and
-        the layers y down to y-depth+1 (depth 0 = until bedrock).
+    master dig <x> <z> <sizeX> <sizeZ> [topY] [bottomY|bedrock] [workers]
+        Fly (by GPS, at CRUISE_Y or higher, without breaking anything) to
+        the area x..x+sizeX-1, z..z+sizeZ-1 and deploy there. The area is
+        mined from topY (its highest block) down to bottomY. Anything left
+        off the command line is asked for.
     master <width> <length> <depth> [workers]
         Deploy right here: the area starts in the block in front of the
         master and extends <length> blocks forward and <width> blocks to its
@@ -34,7 +35,7 @@ local DUMP_CHEST_SLOT = 15
 local FUEL_CHEST_SLOT = 16
 local HELLO_TIMEOUT   = 15  -- seconds for a placed worker to boot and say hello
 local LEAVE_TIMEOUT   = 120 -- seconds for a worker to clear the spawn block
-local CRUISE_ABOVE    = 6   -- travel this far above the higher of start and destination
+local CRUISE_Y        = 200 -- fly at least this high when travelling (use ~130 before 1.18)
 local MAX_Y           = 318 -- highest level the master will climb to while travelling
 local FUEL_MARGIN     = 100 -- spare fuel required on top of the travel estimate
 
@@ -50,7 +51,7 @@ local workers = {} -- { id, x0, x1, phase, msg, fuel, progress, y }
 local function usage()
   print("Usage:")
   print("  master gps <x> <y> <z> <facing> [height]")
-  print("  master dig <x> <y> <z> <sizeX> <sizeZ> <depth> [workers]")
+  print("  master dig <x> <z> <sizeX> <sizeZ> [topY] [bottomY|bedrock] [workers]")
   print("  master <width> <length> <depth> [workers]")
   print("  master monitor")
   print("  master recall")
@@ -160,24 +161,33 @@ local function refuelMaster(need)
     if turtle.getItemCount(s) == 0 then slot = s break end
   end
   if not slot or turtle.getItemCount(FUEL_CHEST_SLOT) == 0 then return false end
+  -- Put the chest in an empty space above or below; never break a block for it.
+  local place, suck, drop, dig
+  if not turtle.detectUp() then
+    place, suck, drop, dig = turtle.placeUp, turtle.suckUp, turtle.dropUp, turtle.digUp
+  elseif not turtle.detectDown() then
+    place, suck, drop, dig = turtle.placeDown, turtle.suckDown, turtle.dropDown, turtle.digDown
+  else
+    return false
+  end
   turtle.select(FUEL_CHEST_SLOT)
-  if turtle.detectUp() then turtle.digUp() end
-  if not turtle.placeUp() then return false end
+  if not place() then return false end
   turtle.select(slot)
   while turtle.getFuelLevel() < need do
-    if turtle.getItemCount(slot) == 0 and not turtle.suckUp() then break end
+    if turtle.getItemCount(slot) == 0 and not suck() then break end
     if not turtle.refuel(1) then break end
   end
-  if turtle.getItemCount(slot) > 0 then turtle.dropUp() end
+  if turtle.getItemCount(slot) > 0 then drop() end
   turtle.select(FUEL_CHEST_SLOT)
-  turtle.digUp()
+  dig()
   turtle.select(1)
   return turtle.getFuelLevel() >= need
 end
 
--- Moves one block, digging through anything breakable. Returns false if the
--- way is blocked by an unbreakable block or the world's height limits.
-local function step(dir)
+-- Moves one block. Only digs when `dig` is set; otherwise anything solid
+-- (other than a turtle, which is waited for) counts as blocked. Returns false
+-- if blocked or at the world's height limits.
+local function step(dir, dig)
   local a = STEP[dir]
   local level = turtle.getFuelLevel()
   if level ~= "unlimited" and level < FUEL_MARGIN then
@@ -197,7 +207,7 @@ local function step(dir)
       local found, d = a.inspect()
       if found and d.name:find("^computercraft:turtle") then
         sleep(1)
-      elseif not a.dig() then
+      elseif not (dig and a.dig()) then
         return false
       end
     elseif err and (err:find("^Too") or err:find("leave the world")) then
@@ -220,13 +230,13 @@ local function turnTo(h)
   end
 end
 
--- Finds the master's position and facing by moving one block and asking GPS again.
+-- Finds the master's position and facing by moving one block and asking GPS
+-- again. Never digs: if it is boxed in sideways, it tries one block higher.
 local function findHeading()
   local x, y, z = locate()
   nav = { x = x, y = y, z = z }
-  for pass = 1, 2 do
+  for attempt = 1, 2 do
     for _ = 1, 4 do
-      if pass == 2 then turtle.dig() end
       if turtle.forward() then
         local nx, _, nz = locate()
         for h = 0, 3 do
@@ -238,14 +248,36 @@ local function findHeading()
       end
       turtle.turnRight()
     end
+    if attempt == 1 then
+      if not turtle.up() then break end
+      nav.y = nav.y + 1
+    end
   end
-  error("Cannot work out which way the master is facing: it cannot move.", 0)
+  error("Cannot work out which way the master is facing: it has no room to move.", 0)
 end
 
--- Climbs to a cruising height, flies across, then digs down to the target.
--- Unless `noGps` is set, the arrival point is checked against GPS.
-local function travelTo(tx, ty, tz, noGps)
-  local cruise = math.min(MAX_Y, math.max(nav.y, ty) + CRUISE_ABOVE)
+-- Goes straight up from where the master stands without breaking anything.
+-- If something is in the way it comes back down and stops, so it is never
+-- left stranded halfway: the master must start under open sky.
+local function ascend(height)
+  local startY = nav.y
+  while nav.y < height do
+    if not step("up") then
+      if nav.y >= height - 2 then return end -- at the world's height limit
+      local stuckAt = nav.y
+      while nav.y > startY and step("down") do end
+      error(("Something is above the master at y=%d. Place it under open sky."):format(stuckAt + 1), 0)
+    end
+  end
+end
+
+-- Flies to (tx, ty, tz) at cruising height without breaking anything, then
+-- comes straight down. Only the final descent may dig, and only if
+-- `digDescent` is set. Unless `noGps` is set, the arrival point is checked
+-- against GPS.
+local function travelTo(tx, ty, tz, opts)
+  opts = opts or {}
+  local cruise = math.min(MAX_Y, math.max(CRUISE_Y, nav.y, ty))
   local need = math.abs(tx - nav.x) + math.abs(tz - nav.z)
     + math.abs(cruise - nav.y) + math.abs(cruise - ty) + FUEL_MARGIN
   if not refuelMaster(need) then
@@ -255,11 +287,11 @@ local function travelTo(tx, ty, tz, noGps)
   end
 
   print(("Travelling from %d %d %d to %d %d %d"):format(nav.x, nav.y, nav.z, tx, ty, tz))
-  while nav.y < cruise and step("up") do end
+  ascend(cruise)
   local function blocked()
     error(("Path blocked at %d %d %d"):format(nav.x, nav.y, nav.z), 0)
   end
-  -- Steps sideways (or back) when both ahead and above are unbreakable.
+  -- Steps sideways (or back) when both ahead and above are blocked.
   local function sidestep()
     local h = nav.h
     for _, turn in ipairs({ 1, 3, 2 }) do
@@ -282,7 +314,7 @@ local function travelTo(tx, ty, tz, noGps)
     else
       turnTo(nav.z < tz and 1 or 3)
     end
-    -- Dig through obstacles; climb over anything unbreakable.
+    -- Go over obstacles, or around them if that is not possible.
     if step("fwd") then
       prefer = nil
     elseif not step("up") then
@@ -296,10 +328,10 @@ local function travelTo(tx, ty, tz, noGps)
       blocked()
     end
   end
-  -- Something unbreakable directly above the destination cannot be worked around.
-  while nav.y > ty do if not step("down") then blocked() end end
-  while nav.y < ty do if not step("up") then blocked() end end
-  if noGps then return end
+
+  while nav.y > ty do if not step("down", opts.digDescent) then blocked() end end
+  while nav.y < ty do if not step("up", opts.digDescent) then blocked() end end
+  if opts.noGps then return end
 
   local x, y, z = locate()
   if x ~= tx or y ~= ty or z ~= tz then
@@ -331,9 +363,9 @@ end
 -- Places one host computer at (x, y, z) with a modem on top of it and radios
 -- it its coordinates. The computer must already have gpshost.lua installed.
 local function buildHost(x, y, z, computerSlot, modemSlot)
-  travelTo(x, y + 1, z, true)
-  if turtle.detectDown() and not turtle.digDown() then
-    error(("Cannot clear the block at %d %d %d"):format(x, y, z), 0)
+  travelTo(x, y + 1, z, { noGps = true })
+  if turtle.detectDown() then
+    error(("Something is already at %d %d %d; choose another height."):format(x, y, z), 0)
   end
   turtle.select(computerSlot)
   if not turtle.placeDown() then error("Could not place a GPS computer.", 0) end
@@ -371,7 +403,7 @@ local function buildGps(sx, sy, sz, facing, cy)
   end
 
   nav = { x = sx, y = sy, z = sz, h = facing }
-  local need = 2 * math.abs(cy - sy) + 12 * GPS_SPACING + 8 * CRUISE_ABOVE + FUEL_MARGIN
+  local need = 2 * math.abs(math.max(cy, CRUISE_Y) - sy) + 16 * GPS_SPACING + FUEL_MARGIN
   if not refuelMaster(need) then
     printError(("The master needs %d fuel and has %s. Refuel it, or give it a fuel ender "
       .. "chest in slot %d and an empty slot."):format(need, tostring(turtle.getFuelLevel()), FUEL_CHEST_SLOT))
@@ -385,7 +417,8 @@ local function buildGps(sx, sy, sz, facing, cy)
   end
 
   print("Returning to the starting point")
-  travelTo(sx, sy, sz, true)
+  -- It flew up this column, so the way back down is clear.
+  travelTo(sx, sy, sz, { noGps = true })
   turnTo(facing)
   sleep(1)
   local x, y, z = gps.locate(5)
@@ -440,6 +473,38 @@ end
 local function confirm()
   write("Start? (y/n) ")
   return read():lower():sub(1, 1) == "y"
+end
+
+-- Returns `given` if set, otherwise asks until a number (or, if allowed, a
+-- blank answer) is entered.
+local function askNumber(question, given, allowBlank)
+  if given then return math.floor(given) end
+  while true do
+    write(question .. " ")
+    local answer = read()
+    if answer == "" and allowBlank then return nil end
+    if tonumber(answer) then return math.floor(tonumber(answer)) end
+    print("Please enter a number.")
+  end
+end
+
+-- How many workers to send: `given` if set, otherwise asks, with Enter
+-- meaning as many as the master is carrying (and the width allows).
+local function askWorkers(given, width)
+  local turtles = 0
+  for s = 1, 14 do
+    if isTurtleItem(s) then turtles = turtles + 1 end
+  end
+  local max = math.min(turtles, turtle.getItemCount(FUEL_CHEST_SLOT),
+    turtle.getItemCount(DUMP_CHEST_SLOT), width)
+  if given or max < 1 then return given end
+  while true do
+    write(("How many workers? (1-%d, Enter = %d) "):format(max, max))
+    local answer = read()
+    if answer == "" then return max end
+    local n = tonumber(answer)
+    if n and n >= 1 and n <= max then return math.floor(n) end
+  end
 end
 
 local function deploy(p)
@@ -625,28 +690,43 @@ if args[1] == "gps" then
 end
 
 if args[1] == "dig" then
-  local n = {}
-  for i = 2, 8 do n[i - 1] = tonumber(args[i]) end
-  local x, y, z, sizeX, sizeZ, depth, wanted = n[1], n[2], n[3], n[4], n[5], n[6], n[7]
-  if not (x and y and z and sizeX and sizeZ and depth) or sizeX < 1 or sizeZ < 1 or depth < 0 then
+  local x, z, sizeX, sizeZ = tonumber(args[2]), tonumber(args[3]), tonumber(args[4]), tonumber(args[5])
+  if not (x and z and sizeX and sizeZ) or sizeX < 1 or sizeZ < 1
+      or (args[6] and not tonumber(args[6]))
+      or (args[7] and args[7] ~= "bedrock" and not tonumber(args[7])) then
     usage()
     return
   end
-  x, y, z = math.floor(x), math.floor(y), math.floor(z)
-  sizeX, sizeZ, depth = math.floor(sizeX), math.floor(sizeZ), math.floor(depth)
+  x, z, sizeX, sizeZ = math.floor(x), math.floor(z), math.floor(sizeX), math.floor(sizeZ)
+
+  local top = askNumber("Highest block Y in the work area (include any trees to remove)?",
+    tonumber(args[6]))
+  local bottom
+  if args[7] then
+    bottom = tonumber(args[7]) and math.floor(tonumber(args[7]))
+  else
+    bottom = askNumber("Lowest Y to mine down to? (Enter = bedrock)", nil, true)
+  end
+  if bottom and bottom > top then
+    printError("The lowest Y must not be above the highest.")
+    return
+  end
+  local depth = bottom and (top - bottom + 1) or 0
+  local wanted = askWorkers(tonumber(args[8]), sizeZ)
 
   -- Facing east, "forward" is +x and "right" is +z, so the relative area
   -- (length forward, width to the right) lines up with the world axes.
   print(("Area x %d..%d, z %d..%d, y %d down to %s"):format(
-    x, x + sizeX - 1, z, z + sizeZ - 1, y, depth > 0 and (y - depth + 1) or "bedrock"))
+    x, x + sizeX - 1, z, z + sizeZ - 1, top, bottom or "bedrock"))
   local p = plan(sizeZ, sizeX, depth, wanted)
   if not p or not confirm() then return end
-  p.origin = { x = x, y = y, z = z }
+  p.origin = { x = x, y = top, z = z }
 
   -- A little fuel is needed just to find out which way we are facing.
   refuelMaster(FUEL_MARGIN)
   findHeading()
-  travelTo(x - 1, y + 1, z)
+  -- Park one block west of the area's corner, just above its highest block.
+  travelTo(x - 1, top + 1, z, { digDescent = true })
   turnTo(0)
   print("Arrived. Deploying workers.")
   finish(deploy(p))
@@ -654,13 +734,13 @@ if args[1] == "dig" then
 end
 
 local width, length, depth = tonumber(args[1]), tonumber(args[2]), tonumber(args[3])
-local wanted = tonumber(args[4])
 if not (width and length and depth) or width < 1 or length < 1 or depth < 0 then
   usage()
   return
 end
+width, length, depth = math.floor(width), math.floor(length), math.floor(depth)
 
-local p = plan(math.floor(width), math.floor(length), math.floor(depth), wanted)
+local p = plan(width, length, depth, askWorkers(tonumber(args[4]), width))
 if p and confirm() then
   finish(deploy(p))
 end

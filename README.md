@@ -18,8 +18,9 @@ wherever it is.
 - CC:Tweaked, with the **EnderStorage** mod (or another mod whose ender chests
   work with hoppers and turtles). Vanilla ender chests do not accept items
   from turtles, so they do not work.
-- **Master:** a mining turtle (pickaxe) with a wireless modem. With
-  `master dig`, the pickaxe lets it dig through terrain on the way.
+- **Master:** a mining turtle (pickaxe) with a wireless modem. It never
+  digs on its way to a work site. It uses the pickaxe only at the site, to
+  clear its parking spot and the block where it places the workers.
 - **Workers:** mining turtles (pickaxe) with a wireless modem.
 - **For `master dig` only:** a working GPS constellation. The master can
   build one for you (see below). GPS is not needed when you place the
@@ -73,8 +74,9 @@ modems (ender modems are strongly recommended).
 2. Load the master with the four computers and the modems, in any slots.
    It needs roughly 600 fuel. Alternatively, give it a fuel ender chest in
    slot 16 and leave a slot empty, and it will refuel itself.
-3. Place the master **under open sky**, because it digs through anything
-   above it. Read its coordinates and the direction it faces from the F3
+3. Place the master **under open sky**. It goes straight up and never
+   breaks anything on the way. If something is above it, it comes back down
+   and stops. Read its coordinates and the direction it faces from the F3
    screen. The master's coordinates are the block it occupies. Then run:
 
    ```
@@ -82,7 +84,7 @@ modems (ender modems are strongly recommended).
    ```
 
 The master tracks its own position from the coordinates you give it. It
-flies up to `height` (default 240) and builds the four hosts about 6 blocks
+flies up to `height` (default 240, and never lower than `CRUISE_Y`) and builds the four hosts about 6 blocks
 around the column above its starting point: three level with each other and
 one 6 blocks higher. For each host, it places the computer, switches it on,
 places a modem on top of it, and radios the computer its exact coordinates.
@@ -100,28 +102,60 @@ wireless modems they cover a few hundred blocks at that height.
 ## Mining an area at given coordinates
 
 ```
-master dig <x> <y> <z> <sizeX> <sizeZ> <depth> [workers]
+master dig <x> <z> <sizeX> <sizeZ> [topY] [bottomY|bedrock] [workers]
 ```
 
-For example, `master dig 1000 64 -2000 512 512 0` mines x 1000–1511 and
-z −2000 to −1489, from layer 64 down to bedrock.
+For example, `master dig 1000 -2000 512 512` mines x 1000–1511 and
+z −2000 to −1489. The area extends `sizeX` blocks east (+x) and `sizeZ`
+blocks south (+z) from the corner `x, z`.
 
-- `x y z` is the top north-west corner block of the area. The area extends
-  `sizeX` blocks east (+x) and `sizeZ` blocks south (+z).
-- The area includes layer `y` and goes down `depth` layers. `0` means
-  "until bedrock".
+For anything you leave off the command line, the master asks:
 
-After you confirm, the master works out its position and facing by GPS,
-climbs a few blocks above the higher of its start and destination, and
-flies there. It digs through any obstacle it can. It climbs over, or steps
-around, any obstacle it cannot dig. It then parks at `x-1, y+1, z` facing east and deploys the
-workers. The workers' strips run north–south across the Z axis, and each
-strip is `sizeX` blocks long.
+```
+Highest block Y in the work area (include any trees to remove)? 92
+Lowest Y to mine down to? (Enter = bedrock) 12
+How many workers? (1-10, Enter = 10)
+Area x 1000..1511, z -2000..-1489, y 92 down to 12
+Deploying 10 worker(s), strips of 51-52 blocks, depth 81
+Start? (y/n)
+```
+
+- **Highest block Y:** mining starts at this layer. The workers travel to
+  their strips one block above it, over the top of everything. If you give
+  a number that is too low, anything above it is left standing.
+- **Lowest Y:** the bottom layer to mine. Press Enter to mine down to bedrock.
+- **Workers:** how many to send. Press Enter to send every worker the master
+  is carrying (up to the width of the area).
+
+To skip the questions, give all the values on the command line, for
+example `master dig 1000 -2000 512 512 92 12 10`.
+
+### The journey
+
+After you confirm, the master:
+
+1. Works out its position and facing by GPS. If it has no room to move
+   sideways, it tries one block higher.
+2. Goes straight up to `CRUISE_Y` (default 200; see *Settings*). If
+   anything is above it, it comes back down and stops. **Start it under
+   open sky.**
+3. Flies across at that height **without breaking anything**. It goes over
+   anything in its way, or around it if it cannot go over. If it is still
+   blocked after 64 detours without getting closer, it stops and reports
+   where it is.
+4. Comes down just outside the work area, one block west of the corner and
+   one block above the highest block (`x-1, topY+1, z`). It faces east and
+   deploys the workers there.
+
+Only in step 4 does the master break anything: if its parking column
+at the edge of the work area is not clear, it digs down. The workers' strips
+run north–south across the Z axis, and each strip is `sizeX` blocks long.
 
 The master needs fuel for the journey. Before it sets off, it checks the
-distance. If it is short of fuel and one of slots 1–14 is empty, it tops up
-from one of its fuel ender chests. Otherwise, it stops and tells you how
-much fuel it needs.
+distance, including the climb to cruising height. If it is short of fuel and
+one of slots 1–14 is empty, it tops up from one of its fuel ender chests. It
+does the same during the journey if detours use more fuel than it
+expected. Otherwise, it stops and tells you how much fuel it needs.
 
 ## Mining where the master stands
 
@@ -136,9 +170,10 @@ master <width> <length> <depth> [workers]
   blocks forward and `width` blocks to the master's **right**.
 - Digging starts at the layer below the master and goes down `depth` layers.
   A depth of `0` means "until bedrock or another unbreakable block".
-- The width is divided into one strip per worker. The number of workers is
-  the smallest of: the turtles loaded, the chests loaded, the width, and the
-  optional `workers` argument.
+- The width is divided into one strip per worker. If you leave off
+  `workers`, the master asks how many to send. Press Enter to send as many
+  as it can: the smallest of the turtles loaded, the chests loaded and the
+  width.
 
 The master places the workers one at a time, starting with the farthest
 strip. Each worker travels along the row in front of the master to its
@@ -191,7 +226,13 @@ and continues the journey.
 
 ## Settings
 
-The settings are at the top of `worker.lua`:
+The master's travel height is set at the top of `master.lua`:
+
+| Setting    | Default | Meaning |
+|------------|---------|---------|
+| `CRUISE_Y` | 200     | The lowest height at which the master flies between places. Choose a height above the terrain and buildings in your world. For Minecraft 1.18 and later, 200 clears nearly all terrain. Before 1.18, about 130 is enough. |
+
+The worker settings are at the top of `worker.lua`:
 
 | Setting           | Default | Meaning |
 |-------------------|---------|---------|
