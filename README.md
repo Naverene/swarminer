@@ -7,6 +7,8 @@ built-in `excavate` program. It does not return to the surface: it empties
 its inventory into a *dump* ender chest and refuels from a *fuel* ender chest
 wherever it is.
 
+Using **OpenComputers** instead? See [`opencomputers/README.md`](opencomputers/README.md).
+
 | File         | Runs on        | Purpose                                            |
 |--------------|----------------|----------------------------------------------------|
 | `master.lua` | master turtle  | Places the workers, hands out jobs, shows a status screen |
